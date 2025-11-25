@@ -3,12 +3,16 @@
 #include <deque>
 #include <unordered_map>
 #include <rclcpp/rclcpp.hpp>
+#include <vector>
 
 #include <OgreSceneNode.h>
 #include <OgreSceneManager.h>
 
 #include <rviz_rendering/objects/axes.hpp>
 #include <rviz_rendering/objects/point_cloud.hpp>
+#include <rviz_rendering/objects/shape.hpp>
+#include <rviz_rendering/objects/movable_text.hpp>
+
 
 #include <factor_graph_interfaces/msg/factor_graph.hpp>
 #include <factor_graph_interfaces/srv/get_point_cloud.hpp>
@@ -47,6 +51,10 @@ public:
 private:
   std::unordered_map<std::uint64_t, std::shared_ptr<PoseNode>> pose_nodes;
   std::shared_ptr<Lines> factor_lines;
+  std::vector<std::shared_ptr<rviz_rendering::Shape>> landmarks_;
+
+  std::unordered_map<std::uint64_t, std::shared_ptr<rviz_rendering::MovableText>> pose_labels_;
+  std::vector<std::shared_ptr<rviz_rendering::MovableText>> landmark_labels_;
 
   bool show_axes;
   float axes_length;
@@ -58,10 +66,13 @@ private:
   rviz_rendering::PointCloud::RenderMode point_style;
 
   std::shared_ptr<PointColorSettings> color_settings;
+  bool show_landmarks_ = true;
+  float landmark_scale_ = 0.20f;
+
 
   Ogre::SceneNode* frame_node_;
   Ogre::SceneManager* scene_manager_;
-
+ 
   rclcpp::Client<GetPointCloud>::SharedPtr get_point_cloud;
 
   int max_requests;

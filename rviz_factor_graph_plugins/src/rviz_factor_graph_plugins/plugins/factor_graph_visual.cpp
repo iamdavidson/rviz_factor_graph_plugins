@@ -30,11 +30,23 @@ FactorGraphVisual::~FactorGraphVisual() {
   scene_manager_->destroySceneNode(frame_node_);
 }
 
-void FactorGraphVisual::reset() {
+void FactorGraphVisual::reset()
+{
   last_graph_msg.reset();
   pose_nodes.clear();
   factor_lines->clear();
+
+  // Landmarken-Objekte freigeben
+  for (auto& lm : landmarks_) lm.reset();
+  landmarks_.clear();
+
+  for (auto& lbl : pose_labels_) lbl.second.reset();
+  pose_labels_.clear();
+  for (auto& lbl : landmark_labels_) lbl.reset();
+  landmark_labels_.clear();
+
 }
+
 
 void FactorGraphVisual::update() {
   if (!get_point_cloud->wait_for_service(std::chrono::nanoseconds(1)) || !last_graph_msg || last_graph_msg->poses.empty()) {
@@ -102,17 +114,21 @@ void FactorGraphVisual::update() {
     get_point_cloud_results.emplace_back(get_point_cloud->async_send_request(req), get_point_cloud);
   }
 }
-
-void FactorGraphVisual::setVisibility(bool show_factors, bool show_axes, bool show_points) {
+void FactorGraphVisual::setVisibility(bool show_factors, bool show_axes, bool show_points)
+{
   factor_lines->setVisible(show_factors);
-
   this->show_axes = show_axes;
   this->show_points = show_points;
 
-  for (auto& node : pose_nodes) {
+  for (auto& node : pose_nodes)
     node.second->setVisibility(show_axes, show_points);
-  }
+
+  // Landmarken sichtbar machen
+  for (auto& shp : landmarks_)
+    if (shp) shp->getRootNode()->setVisible(show_landmarks_);
 }
+
+
 
 void FactorGraphVisual::setFactorColor(const Ogre::ColourValue& factor_color) {
   factor_lines->setColor(factor_color);
@@ -123,12 +139,18 @@ void FactorGraphVisual::setPose(const Ogre::Vector3& position, const Ogre::Quate
   frame_node_->setOrientation(orientation);
 }
 
-void FactorGraphVisual::setMessage(const FactorGraph::ConstSharedPtr& graph_msg) {
+void FactorGraphVisual::setMessage(const FactorGraph::ConstSharedPtr& graph_msg)
+{
   last_graph_msg = graph_msg;
 
+  // === Pose-Nodes aktualisieren oder neu anlegen ===
   for (int i = 0; i < graph_msg->poses.size(); i++) {
     const std::uint64_t key = graph_msg->poses[i].key;
-    const bool has_points = graph_msg->poses[i].type == factor_graph_interfaces::msg::PoseWithID::POINTS;
+    const char symbol = (key >> 56);
+    const size_t index = ((key << 8) >> 8);
+
+    const bool has_points =
+        graph_msg->poses[i].type == factor_graph_interfaces::msg::PoseWithID::POINTS;
 
     const auto& trans = graph_msg->poses[i].pose.position;
     const auto& quat = graph_msg->poses[i].pose.orientation;
@@ -136,36 +158,149 @@ void FactorGraphVisual::setMessage(const FactorGraph::ConstSharedPtr& graph_msg)
     const Ogre::Vector3 pos(trans.x, trans.y, trans.z);
     const Ogre::Quaternion ori(quat.w, quat.x, quat.y, quat.z);
 
-    auto node = pose_nodes.find(key);
-    if (node == pose_nodes.end()) {
-      node = pose_nodes.emplace_hint(node, key, new PoseNode(scene_manager_, frame_node_));
-      node->second->setAxesShape(axes_length, axes_radius);
-      node->second->setVisibility(show_axes, show_points);
-
-      if (has_points) {
+    auto it = pose_nodes.find(key);
+    if (it == pose_nodes.end()) {
+      it = pose_nodes.emplace_hint(it, key, new PoseNode(scene_manager_, frame_node_));
+      it->second->setAxesShape(axes_length, axes_radius);
+      it->second->setVisibility(show_axes, show_points);
+      if (has_points)
         load_priority_queue.emplace_back(key);
+    }
+    it->second->setPose(pos, ori);
+
+    // 🔹 Text-Label für Pose erzeugen oder aktualisieren
+    auto label_it = pose_labels_.find(key);
+    if (label_it == pose_labels_.end()) {
+      auto text = std::make_shared<rviz_rendering::MovableText>(std::to_string(index));
+      text->setCharacterHeight(0.18f);
+      text->setColor(Ogre::ColourValue(1.0f, 1.0f, 1.0f)); // weiß
+      text->setTextAlignment(rviz_rendering::MovableText::H_CENTER,
+                             rviz_rendering::MovableText::V_ABOVE);
+
+      // 💡 "Always-on-top" Workaround via Material
+      {
+        Ogre::MaterialPtr mat = text->getMaterial();
+        if (!mat.isNull()) {
+          mat->setDepthCheckEnabled(false);
+          mat->setDepthWriteEnabled(false);
+          mat->setSceneBlending(Ogre::SBT_TRANSPARENT_ALPHA);
+        }
+      }
+
+      auto text_node = frame_node_->createChildSceneNode(pos + Ogre::Vector3(0, 0, 0.5f));
+      text_node->attachObject(text.get());
+      text_node->setInheritOrientation(false);
+      pose_labels_[key] = text;
+    } else {
+      label_it->second->setCaption(std::to_string(index));
+    }
+  }
+
+  // === Alle Linien vorbereiten ===
+  std::vector<Ogre::Vector3> factor_points;
+  factor_points.reserve(graph_msg->binary_factors.size() * 2);
+
+  // Map von Landmark-Key -> zugehörige Pose-Key(s)
+  std::multimap<uint64_t, uint64_t> landmark_links;
+
+  // === Pose–Pose-Edges und Landmark-Links erkennen ===
+  for (const auto& factor : graph_msg->binary_factors) {
+    const uint64_t key1 = factor.keys[0];
+    const uint64_t key2 = factor.keys[1];
+
+    const bool is_pose1 = pose_nodes.find(key1) != pose_nodes.end();
+    const bool is_pose2 = pose_nodes.find(key2) != pose_nodes.end();
+
+    // Wenn beide Knoten Posen sind -> normale BetweenFactor-Linie
+    if (is_pose1 && is_pose2) {
+      factor_points.emplace_back(pose_nodes.at(key1)->getPosition());
+      factor_points.emplace_back(pose_nodes.at(key2)->getPosition());
+    }
+    // Wenn eine Pose und eine Landmark -> Landmark-Link speichern
+    else if (is_pose1 && !is_pose2) {
+      landmark_links.emplace(key2, key1);
+    }
+    else if (!is_pose1 && is_pose2) {
+      landmark_links.emplace(key1, key2);
+    }
+  }
+
+  // === Landmarken zeichnen ===
+  for (auto& lm : landmarks_) lm.reset();
+  landmarks_.clear();
+  for (auto& lbl : landmark_labels_) lbl.reset();
+  landmark_labels_.clear();
+
+  std::vector<Ogre::Vector3> landmark_edges;
+
+  if (show_landmarks_) {
+    for (const auto& point : graph_msg->points) {
+      const std::uint64_t key = point.key;
+      const char symbol = (key >> 56);
+      const size_t index = ((key << 8) >> 8);
+
+      Ogre::Vector3 landmark_pos(point.point.x, point.point.y, point.point.z + 0.1f);
+
+      auto shp = std::make_shared<rviz_rendering::Shape>(
+          rviz_rendering::Shape::Sphere, scene_manager_, frame_node_);
+      shp->setScale(Ogre::Vector3(0.40f, 0.40f, 0.40f));
+      shp->setColor(1.0f, 1.0f, 0.0f, 1.0f); // gelb
+      shp->setPosition(landmark_pos);
+      shp->getRootNode()->setVisible(true);
+      landmarks_.push_back(shp);
+
+      // 🔹 Label für Landmark
+      auto text = std::make_shared<rviz_rendering::MovableText>(std::to_string(index));
+      text->setCharacterHeight(0.18f);
+      text->setColor(Ogre::ColourValue(1.0f, 1.0f, 0.0f)); // gelb
+      text->setTextAlignment(rviz_rendering::MovableText::H_CENTER,
+                             rviz_rendering::MovableText::V_ABOVE);
+
+      // 💡 "Always-on-top" Workaround via Material
+      {
+        Ogre::MaterialPtr mat = text->getMaterial();
+        if (!mat.isNull()) {
+          mat->setDepthCheckEnabled(false);
+          mat->setDepthWriteEnabled(false);
+          mat->setSceneBlending(Ogre::SBT_TRANSPARENT_ALPHA);
+        }
+      }
+
+      auto text_node = frame_node_->createChildSceneNode(landmark_pos + Ogre::Vector3(0, 0, 0.5f));
+      text_node->attachObject(text.get());
+      text_node->setInheritOrientation(false);
+      landmark_labels_.push_back(text);
+
+      // Linien zu allen Posen, die diese Landmark sehen
+      auto range = landmark_links.equal_range(point.key);
+      for (auto it = range.first; it != range.second; ++it) {
+        uint64_t pose_key = it->second;
+        auto pose_it = pose_nodes.find(pose_key);
+        if (pose_it != pose_nodes.end()) {
+          landmark_edges.emplace_back(pose_it->second->getPosition());
+          landmark_edges.emplace_back(landmark_pos);
+        }
       }
     }
-    node->second->setPose(pos, ori);
   }
 
-  // TODO: use indexed lines for better performance
-  std::vector<Ogre::Vector3> factor_points;
-  factor_points.reserve(graph_msg->binary_factors.size());
+  // === Alle Linien (Pose-Pose + Pose-Landmark) zusammenführen ===
+  std::vector<Ogre::Vector3> all_lines;
+  all_lines.reserve(factor_points.size() + landmark_edges.size());
+  all_lines.insert(all_lines.end(), factor_points.begin(), factor_points.end());
+  all_lines.insert(all_lines.end(), landmark_edges.begin(), landmark_edges.end());
 
-  for (const auto& factor : graph_msg->binary_factors) {
-    const auto node1 = pose_nodes.find(factor.keys[0]);
-    const auto node2 = pose_nodes.find(factor.keys[1]);
+  factor_lines->setPoints(all_lines, false);
 
-    if (node1 == pose_nodes.end() || node2 == pose_nodes.end()) {
-      continue;
-    }
-
-    factor_points.emplace_back(node1->second->getPosition());
-    factor_points.emplace_back(node2->second->getPosition());
-  }
-  this->factor_lines->setPoints(factor_points, false);
+  RCLCPP_DEBUG(
+      rclcpp::get_logger("rviz_factor_graph_plugins"),
+      "Rendered %zu poses, %zu factors, %zu landmarks (%zu landmark edges)",
+      graph_msg->poses.size(),
+      graph_msg->binary_factors.size(),
+      graph_msg->points.size(),
+      landmark_edges.size() / 2);
 }
+
 
 void FactorGraphVisual::setAxesShape(float length, float radius) {
   axes_length = length;

@@ -57,6 +57,9 @@ factor_graph_interfaces::msg::FactorGraph::SharedPtr convert_to_msg(const gtsam:
   }
 
   for (const auto& factor : graph) {
+
+    if (!factor) continue;  
+
     switch (factor->keys().size()) {
       case 1:
         break;
