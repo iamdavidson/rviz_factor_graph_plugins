@@ -7,7 +7,7 @@
 
 namespace factor_graph_interfaces {
 
-factor_graph_interfaces::msg::FactorGraph::SharedPtr convert_to_msg(const gtsam::NonlinearFactorGraph& graph, const gtsam::Values& values) {
+inline factor_graph_interfaces::msg::FactorGraph::SharedPtr convert_to_msg(const gtsam::NonlinearFactorGraph& graph, const gtsam::Values& values) {
   using namespace msg;
   auto graph_msg = std::make_shared<FactorGraph>();
 
