@@ -11,7 +11,7 @@ inline factor_graph_interfaces::msg::FactorGraph::SharedPtr convert_to_msg(const
   using namespace msg;
   auto graph_msg = std::make_shared<FactorGraph>();
 
-  std::cout << graph.size() << " factors   " << values.size() << " values" << std::endl;
+  // std::cout << graph.size() << " factors   " << values.size() << " values" << std::endl;
 
   std::unordered_set<std::uint64_t> keys;
   for (const auto& value : values) {
