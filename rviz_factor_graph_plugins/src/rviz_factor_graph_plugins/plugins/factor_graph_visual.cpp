@@ -1,15 +1,18 @@
 #include <rviz_factor_graph_plugins/plugins/factor_graph_visual.hpp>
 
+#include <cmath>
 #include <iostream>
-#include <rviz_factor_graph_plugins/plugins/pose_node.hpp>
+#include <map>
+
 #include <rviz_factor_graph_plugins/common/rviz_lines.hpp>
+#include <rviz_factor_graph_plugins/plugins/pose_node.hpp>
 
 namespace rviz_factor_graph_plugins {
 
 FactorGraphVisual::FactorGraphVisual(Ogre::SceneManager* scene_manager, Ogre::SceneNode* parent_node) {
-  this->scene_manager_ = scene_manager;
-  this->frame_node_ = parent_node->createChildSceneNode();
-  factor_lines.reset(new Lines(scene_manager, this->frame_node_));
+  scene_manager_ = scene_manager;
+  frame_node_ = parent_node->createChildSceneNode();
+  factor_lines.reset(new Lines(scene_manager, frame_node_));
 
   max_requests = 5;
   max_load_count = 15;
@@ -26,30 +29,59 @@ FactorGraphVisual::FactorGraphVisual(Ogre::SceneManager* scene_manager, Ogre::Sc
 }
 
 FactorGraphVisual::~FactorGraphVisual() {
+  reset();
   frame_node_->detachAllObjects();
   scene_manager_->destroySceneNode(frame_node_);
 }
 
-void FactorGraphVisual::reset()
-{
-  last_graph_msg.reset();
-  pose_nodes.clear();
-  factor_lines->clear();
+void FactorGraphVisual::clearPoseLabels() {
+  // Pose-Labels hängen an PoseNodes -> Nodes sauber zerstören
+  for (auto& [key, handle] : pose_labels_) {
+    if (handle.node) {
+      handle.node->detachAllObjects();
+      scene_manager_->destroySceneNode(handle.node);
+      handle.node = nullptr;
+    }
+    handle.text.reset();
+  }
+  pose_labels_.clear();
+}
 
-  // Landmarken-Objekte freigeben
+void FactorGraphVisual::clearLandmarkLabels() {
+  // Landmark-Labels hängen an frame_node_ -> Nodes sauber zerstören
+  for (auto& handle : landmark_labels_) {
+    if (handle.node) {
+      handle.node->detachAllObjects();
+      scene_manager_->destroySceneNode(handle.node);
+      handle.node = nullptr;
+    }
+    handle.text.reset();
+  }
+  landmark_labels_.clear();
+}
+
+void FactorGraphVisual::clearLandmarks() {
+  // Shapes freigeben
   for (auto& lm : landmarks_) lm.reset();
   landmarks_.clear();
 
-  for (auto& lbl : pose_labels_) lbl.second.reset();
-  pose_labels_.clear();
-  for (auto& lbl : landmark_labels_) lbl.reset();
-  landmark_labels_.clear();
-
+  clearLandmarkLabels();
 }
 
+void FactorGraphVisual::reset() {
+  last_graph_msg.reset();
+
+  // Labels & Landmarks zuerst (weil PoseNodes ggf. Parent-Nodes sind)
+  clearPoseLabels();
+  clearLandmarks();
+
+  pose_nodes.clear();
+  factor_lines->clear();
+}
 
 void FactorGraphVisual::update() {
-  if (!get_point_cloud->wait_for_service(std::chrono::nanoseconds(1)) || !last_graph_msg || last_graph_msg->poses.empty()) {
+  if (!get_point_cloud || !get_point_cloud->wait_for_service(std::chrono::nanoseconds(1)) ||
+      !last_graph_msg || last_graph_msg->poses.empty()) {
     return;
   }
 
@@ -73,31 +105,32 @@ void FactorGraphVisual::update() {
         node->second->setPointCloud(response->points, color_settings);
         node->second->setPointStyle(point_size, point_alpha, point_style);
       } else {
-        RCLCPP_WARN_STREAM(rclcpp::get_logger("rviz_factor_graph_plugins"), "Node for the fetched points is not found. key=" << response->key << " symbol=" << chr << index);
+        RCLCPP_WARN_STREAM(rclcpp::get_logger("rviz_factor_graph_plugins"),
+                           "Node for the fetched points is not found. key=" << response->key
+                                                                            << " symbol=" << chr
+                                                                            << index);
       }
     } else {
-      RCLCPP_WARN_STREAM(rclcpp::get_logger("rviz_factor_graph_plugins"), "Failed to retrieve points for key=" << response->key << " symbol=" << chr << index);
+      RCLCPP_WARN_STREAM(rclcpp::get_logger("rviz_factor_graph_plugins"),
+                         "Failed to retrieve points for key=" << response->key
+                                                              << " symbol=" << chr << index);
     }
   }
 
   // Issue asynchronous points fetching calls
-  for (int i = 0; i < max_load_count && get_point_cloud_results.size() < max_requests; i++) {
+  for (int i = 0; i < max_load_count && (int)get_point_cloud_results.size() < max_requests; i++) {
     auto req = std::make_shared<GetPointCloud::Request>();
 
-    // Load points for newly created frames
     if (!load_priority_queue.empty()) {
       req->key = load_priority_queue.front();
       load_priority_queue.pop_front();
-    }
-    // Load points for existing nodes without points if the priority queue is empty
-    else {
+    } else {
       const auto& poses = last_graph_msg->poses;
       const auto& pose = poses[(loading_counter++) % poses.size()];
 
       if (pose.type != factor_graph_interfaces::msg::PoseWithID::POINTS) {
         continue;
       }
-
       req->key = pose.key;
     }
 
@@ -107,28 +140,34 @@ void FactorGraphVisual::update() {
     }
 
     if (found->second->points && !found->second->recoloringRequired(*color_settings)) {
-      // Avoid re-loading because the node already has points
-      continue;
+      continue;  // already has points
     }
 
     get_point_cloud_results.emplace_back(get_point_cloud->async_send_request(req), get_point_cloud);
   }
 }
-void FactorGraphVisual::setVisibility(bool show_factors, bool show_axes, bool show_points)
-{
+
+void FactorGraphVisual::setVisibility(bool show_factors, bool show_axes, bool show_points) {
   factor_lines->setVisible(show_factors);
   this->show_axes = show_axes;
   this->show_points = show_points;
 
-  for (auto& node : pose_nodes)
+  for (auto& node : pose_nodes) {
     node.second->setVisibility(show_axes, show_points);
+  }
 
-  // Landmarken sichtbar machen
-  for (auto& shp : landmarks_)
+  for (auto& shp : landmarks_) {
     if (shp) shp->getRootNode()->setVisible(show_landmarks_);
+  }
+
+  // Labels sinnvoll mitskalieren: Pose-Labels an show_axes, Landmark-Labels an show_landmarks_
+  for (auto& [key, handle] : pose_labels_) {
+    if (handle.node) handle.node->setVisible(show_axes);
+  }
+  for (auto& handle : landmark_labels_) {
+    if (handle.node) handle.node->setVisible(show_landmarks_);
+  }
 }
-
-
 
 void FactorGraphVisual::setFactorColor(const Ogre::ColourValue& factor_color) {
   factor_lines->setColor(factor_color);
@@ -139,18 +178,16 @@ void FactorGraphVisual::setPose(const Ogre::Vector3& position, const Ogre::Quate
   frame_node_->setOrientation(orientation);
 }
 
-void FactorGraphVisual::setMessage(const FactorGraph::ConstSharedPtr& graph_msg)
-{
+void FactorGraphVisual::setMessage(const FactorGraph::ConstSharedPtr& graph_msg) {
   last_graph_msg = graph_msg;
 
   // === Pose-Nodes aktualisieren oder neu anlegen ===
-  for (int i = 0; i < graph_msg->poses.size(); i++) {
+  for (size_t i = 0; i < graph_msg->poses.size(); i++) {
     const std::uint64_t key = graph_msg->poses[i].key;
-    const char symbol = (key >> 56);
     const size_t index = ((key << 8) >> 8);
 
     const bool has_points =
-        graph_msg->poses[i].type == factor_graph_interfaces::msg::PoseWithID::POINTS;
+        (graph_msg->poses[i].type == factor_graph_interfaces::msg::PoseWithID::POINTS);
 
     const auto& trans = graph_msg->poses[i].pose.position;
     const auto& quat = graph_msg->poses[i].pose.orientation;
@@ -163,21 +200,23 @@ void FactorGraphVisual::setMessage(const FactorGraph::ConstSharedPtr& graph_msg)
       it = pose_nodes.emplace_hint(it, key, new PoseNode(scene_manager_, frame_node_));
       it->second->setAxesShape(axes_length, axes_radius);
       it->second->setVisibility(show_axes, show_points);
-      if (has_points)
+      if (has_points) {
         load_priority_queue.emplace_back(key);
+      }
     }
+
     it->second->setPose(pos, ori);
 
-    // 🔹 Text-Label für Pose erzeugen oder aktualisieren
-    auto label_it = pose_labels_.find(key);
-    if (label_it == pose_labels_.end()) {
+    // === Pose-Label: als Child vom PoseNode-SceneNode (wandert automatisch mit) ===
+    auto lbl_it = pose_labels_.find(key);
+    if (lbl_it == pose_labels_.end()) {
       auto text = std::make_shared<rviz_rendering::MovableText>(std::to_string(index));
       text->setCharacterHeight(0.18f);
-      text->setColor(Ogre::ColourValue(1.0f, 1.0f, 1.0f)); // weiß
+      text->setColor(Ogre::ColourValue(1.0f, 1.0f, 1.0f));
       text->setTextAlignment(rviz_rendering::MovableText::H_CENTER,
                              rviz_rendering::MovableText::V_ABOVE);
 
-      // 💡 "Always-on-top" Workaround via Material
+      // Always-on-top Workaround
       {
         Ogre::MaterialPtr mat = text->getMaterial();
         if (!mat.isNull()) {
@@ -187,20 +226,26 @@ void FactorGraphVisual::setMessage(const FactorGraph::ConstSharedPtr& graph_msg)
         }
       }
 
-      auto text_node = frame_node_->createChildSceneNode(pos + Ogre::Vector3(0, 0, 0.5f));
-      text_node->attachObject(text.get());
-      text_node->setInheritOrientation(false);
-      pose_labels_[key] = text;
+      // >>> WICHTIG: PoseNode muss getSceneNode() anbieten! <<<
+      Ogre::SceneNode* pose_scene_node = it->second->getSceneNode();  // ggf. anpassen!
+      Ogre::SceneNode* label_node =
+          pose_scene_node->createChildSceneNode(Ogre::Vector3(0, 0, 0.5f));
+      label_node->attachObject(text.get());
+      label_node->setInheritOrientation(false);
+      label_node->setVisible(show_axes);
+
+      pose_labels_[key] = TextLabelHandle{text, label_node};
     } else {
-      label_it->second->setCaption(std::to_string(index));
+      lbl_it->second.text->setCaption(std::to_string(index));
+      if (lbl_it->second.node) lbl_it->second.node->setVisible(show_axes);
     }
   }
 
-  // === Alle Linien vorbereiten ===
+  // === Linien vorbereiten ===
   std::vector<Ogre::Vector3> factor_points;
   factor_points.reserve(graph_msg->binary_factors.size() * 2);
 
-  // Map von Landmark-Key -> zugehörige Pose-Key(s)
+  // Map Landmark-Key -> Pose-Key(s)
   std::multimap<uint64_t, uint64_t> landmark_links;
 
   // === Pose–Pose-Edges und Landmark-Links erkennen ===
@@ -208,35 +253,27 @@ void FactorGraphVisual::setMessage(const FactorGraph::ConstSharedPtr& graph_msg)
     const uint64_t key1 = factor.keys[0];
     const uint64_t key2 = factor.keys[1];
 
-    const bool is_pose1 = pose_nodes.find(key1) != pose_nodes.end();
-    const bool is_pose2 = pose_nodes.find(key2) != pose_nodes.end();
+    const bool is_pose1 = (pose_nodes.find(key1) != pose_nodes.end());
+    const bool is_pose2 = (pose_nodes.find(key2) != pose_nodes.end());
 
-    // Wenn beide Knoten Posen sind -> normale BetweenFactor-Linie
     if (is_pose1 && is_pose2) {
       factor_points.emplace_back(pose_nodes.at(key1)->getPosition());
       factor_points.emplace_back(pose_nodes.at(key2)->getPosition());
-    }
-    // Wenn eine Pose und eine Landmark -> Landmark-Link speichern
-    else if (is_pose1 && !is_pose2) {
+    } else if (is_pose1 && !is_pose2) {
       landmark_links.emplace(key2, key1);
-    }
-    else if (!is_pose1 && is_pose2) {
+    } else if (!is_pose1 && is_pose2) {
       landmark_links.emplace(key1, key2);
     }
   }
 
-  // === Landmarken zeichnen ===
-  for (auto& lm : landmarks_) lm.reset();
-  landmarks_.clear();
-  for (auto& lbl : landmark_labels_) lbl.reset();
-  landmark_labels_.clear();
+  // === Landmarken neu zeichnen (inkl. Labels + Edges) ===
+  clearLandmarks();
 
   std::vector<Ogre::Vector3> landmark_edges;
 
   if (show_landmarks_) {
     for (const auto& point : graph_msg->points) {
       const std::uint64_t key = point.key;
-      const char symbol = (key >> 56);
       const size_t index = ((key << 8) >> 8);
 
       Ogre::Vector3 landmark_pos(point.point.x, point.point.y, point.point.z + 0.1f);
@@ -244,19 +281,18 @@ void FactorGraphVisual::setMessage(const FactorGraph::ConstSharedPtr& graph_msg)
       auto shp = std::make_shared<rviz_rendering::Shape>(
           rviz_rendering::Shape::Sphere, scene_manager_, frame_node_);
       shp->setScale(Ogre::Vector3(0.40f, 0.40f, 0.40f));
-      shp->setColor(1.0f, 1.0f, 0.0f, 1.0f); // gelb
+      shp->setColor(1.0f, 1.0f, 0.0f, 1.0f);
       shp->setPosition(landmark_pos);
       shp->getRootNode()->setVisible(true);
       landmarks_.push_back(shp);
 
-      // 🔹 Label für Landmark
+      // Landmark-Label
       auto text = std::make_shared<rviz_rendering::MovableText>(std::to_string(index));
       text->setCharacterHeight(0.18f);
-      text->setColor(Ogre::ColourValue(1.0f, 1.0f, 0.0f)); // gelb
+      text->setColor(Ogre::ColourValue(1.0f, 1.0f, 0.0f));
       text->setTextAlignment(rviz_rendering::MovableText::H_CENTER,
                              rviz_rendering::MovableText::V_ABOVE);
 
-      // 💡 "Always-on-top" Workaround via Material
       {
         Ogre::MaterialPtr mat = text->getMaterial();
         if (!mat.isNull()) {
@@ -266,12 +302,15 @@ void FactorGraphVisual::setMessage(const FactorGraph::ConstSharedPtr& graph_msg)
         }
       }
 
-      auto text_node = frame_node_->createChildSceneNode(landmark_pos + Ogre::Vector3(0, 0, 0.5f));
-      text_node->attachObject(text.get());
-      text_node->setInheritOrientation(false);
-      landmark_labels_.push_back(text);
+      Ogre::SceneNode* label_node =
+          frame_node_->createChildSceneNode(landmark_pos + Ogre::Vector3(0, 0, 0.5f));
+      label_node->attachObject(text.get());
+      label_node->setInheritOrientation(false);
+      label_node->setVisible(show_landmarks_);
 
-      // Linien zu allen Posen, die diese Landmark sehen
+      landmark_labels_.push_back(TextLabelHandle{text, label_node});
+
+      // Kanten zu Posen
       auto range = landmark_links.equal_range(point.key);
       for (auto it = range.first; it != range.second; ++it) {
         uint64_t pose_key = it->second;
@@ -284,7 +323,7 @@ void FactorGraphVisual::setMessage(const FactorGraph::ConstSharedPtr& graph_msg)
     }
   }
 
-  // === Alle Linien (Pose-Pose + Pose-Landmark) zusammenführen ===
+  // === Pose-Pose + Pose-Landmark zusammenführen ===
   std::vector<Ogre::Vector3> all_lines;
   all_lines.reserve(factor_points.size() + landmark_edges.size());
   all_lines.insert(all_lines.end(), factor_points.begin(), factor_points.end());
@@ -292,15 +331,11 @@ void FactorGraphVisual::setMessage(const FactorGraph::ConstSharedPtr& graph_msg)
 
   factor_lines->setPoints(all_lines, false);
 
-  RCLCPP_DEBUG(
-      rclcpp::get_logger("rviz_factor_graph_plugins"),
-      "Rendered %zu poses, %zu factors, %zu landmarks (%zu landmark edges)",
-      graph_msg->poses.size(),
-      graph_msg->binary_factors.size(),
-      graph_msg->points.size(),
-      landmark_edges.size() / 2);
+  RCLCPP_DEBUG(rclcpp::get_logger("rviz_factor_graph_plugins"),
+               "Rendered %zu poses, %zu factors, %zu landmarks (%zu landmark edges)",
+               graph_msg->poses.size(), graph_msg->binary_factors.size(), graph_msg->points.size(),
+               landmark_edges.size() / 2);
 }
-
 
 void FactorGraphVisual::setAxesShape(float length, float radius) {
   axes_length = length;
@@ -311,7 +346,8 @@ void FactorGraphVisual::setAxesShape(float length, float radius) {
   }
 }
 
-void FactorGraphVisual::setPointStyle(float size, float alpha, rviz_rendering::PointCloud::RenderMode mode) {
+void FactorGraphVisual::setPointStyle(float size, float alpha,
+                                      rviz_rendering::PointCloud::RenderMode mode) {
   point_size = size;
   point_alpha = alpha;
   point_style = mode;
@@ -321,24 +357,24 @@ void FactorGraphVisual::setPointStyle(float size, float alpha, rviz_rendering::P
   }
 }
 
-void FactorGraphVisual::setColorSettings(const std::shared_ptr<PointColorSettings>& color_settings) {
+void FactorGraphVisual::setColorSettings(const std::shared_ptr<PointColorSettings>& new_settings) {
   for (auto& node : pose_nodes) {
     const auto& settings = node.second->color_settings;
 
     bool needs_recoloring = false;
-    needs_recoloring |= (settings.mode != color_settings->mode);
-    needs_recoloring |= (settings.axis != color_settings->axis);
-    needs_recoloring |= (settings.colormap != color_settings->colormap);
-    needs_recoloring |= std::abs(settings.color.r - color_settings->color.r) > 1e-3;
-    needs_recoloring |= std::abs(settings.color.g - color_settings->color.g) > 1e-3;
-    needs_recoloring |= std::abs(settings.color.b - color_settings->color.b) > 1e-3;
+    needs_recoloring |= (settings.mode != new_settings->mode);
+    needs_recoloring |= (settings.axis != new_settings->axis);
+    needs_recoloring |= (settings.colormap != new_settings->colormap);
+    needs_recoloring |= std::abs(settings.color.r - new_settings->color.r) > 1e-3;
+    needs_recoloring |= std::abs(settings.color.g - new_settings->color.g) > 1e-3;
+    needs_recoloring |= std::abs(settings.color.b - new_settings->color.b) > 1e-3;
 
     if (needs_recoloring) {
       node.second->points.reset();
     }
   }
 
-  this->color_settings = color_settings;
+  color_settings = new_settings;
 }
 
 void FactorGraphVisual::setPointsLoadingParams(int max_load_count, int max_requests) {
@@ -346,7 +382,8 @@ void FactorGraphVisual::setPointsLoadingParams(int max_load_count, int max_reque
   this->max_load_count = max_load_count;
 }
 
-void FactorGraphVisual::setGetPointCloudService(std::shared_ptr<rclcpp::Node> node, rclcpp::Client<GetPointCloud>::SharedPtr service) {
+void FactorGraphVisual::setGetPointCloudService(std::shared_ptr<rclcpp::Node> /*node*/,
+                                                rclcpp::Client<GetPointCloud>::SharedPtr service) {
   get_point_cloud = service;
 }
 

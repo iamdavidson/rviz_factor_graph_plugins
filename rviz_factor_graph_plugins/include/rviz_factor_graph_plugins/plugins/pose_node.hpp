@@ -23,6 +23,8 @@ struct PoseNode {
   Ogre::Vector3 getPosition() const;
   Ogre::Quaternion getOrientation() const;
 
+  Ogre::SceneNode* getSceneNode() const { return node; }
+
   void setVisibility(bool show_axes, bool show_points);
 
   void setPose(const Ogre::Vector3& position, const Ogre::Quaternion& orientation);
